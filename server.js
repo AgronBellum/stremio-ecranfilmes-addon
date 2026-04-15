@@ -1,47 +1,126 @@
-const { addonBuilder, serveHTTP, publishToCentral } = require("stremio-addon-sdk");
+const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
+const puppeteer = require("puppeteer-core");
+const chromium = require("@sparticuz/chromium");
 
 // ==========================================
-// CONFIGURAÇÃO
+// CONFIG
 // ==========================================
-const PORT = process.env.PORT || 7000;
-const ADDON_ID = "com.ecranfilmes.fembed-sniffer";
-const ADDON_VERSION = "1.0.0";
-const ADDON_NAME = "Ecran Filmes - Fembed Sniffer";
+const CACHE = new Map();
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutos
+const SNIFF_TIMEOUT = 20000; // 20 segundos
 
 // ==========================================
 // MANIFEST
 // ==========================================
 const manifest = {
-  id: ADDON_ID,
-  version: ADDON_VERSION,
-  name: ADDON_NAME,
-  description: "Extrai streams do Fembed.sx usando sniffer local no Ecran Filmes",
+  id: "com.ecranfilmes.dublado",
+  version: "3.0.0",
+  name: "Ecran Filmes - Dublados ptBR",
+  description: "Filmes e séries dublados via Fembed",
   logo: "https://i.imgur.com/ecranfilmes.png",
-  
-  // Recursos que o addon fornece
   resources: ["stream"],
-  
-  // Tipos de conteúdo suportados
   types: ["movie", "series"],
-  
-  // Catálogos (vazio porque só fornecemos streams)
   catalogs: [],
-  
-  // Prefixos de ID que aceitamos (tmdb)
-  idPrefixes: ["tmdb:"],
-  
-  // Comportamento
-  behaviorHints: {
-    adult: false,
-    p2p: false,
-    configurable: false
+  idPrefixes: ["imdb:", "tmdb:"],
+  behaviorHints: { 
+    adult: false, 
+    p2p: false, 
+    configurable: false 
   }
 };
 
-// ==========================================
-// BUILDER
-// ==========================================
 const builder = new addonBuilder(manifest);
+
+// ==========================================
+// SNIFFER OTIMIZADO PARA RENDER
+// ==========================================
+async function sniffM3U8(embedUrl) {
+  console.log(`[SNIFF] Iniciando: ${embedUrl}`);
+  
+  // Check cache
+  const cached = CACHE.get(embedUrl);
+  if (cached && (Date.now() - cached.time) < CACHE_TTL) {
+    console.log(`[SNIFF] Cache hit!`);
+    return cached.url;
+  }
+  
+  let browser = null;
+  
+  try {
+    // Launch com @sparticuz/chromium (otimizado para serverless)
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      ignoreHTTPSErrors: true
+    });
+    
+    const page = await browser.newPage();
+    
+    // User agent mobile
+    await page.setUserAgent('Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36');
+    await page.setViewport({ width: 1280, height: 720 });
+    
+    let m3u8Found = null;
+    
+    // Intercepta requisições
+    await page.setRequestInterception(true);
+    
+    page.on('request', (req) => {
+      const url = req.url();
+      if (url.includes('r66nv9ed.com') && url.includes('.m3u8')) {
+        if (!m3u8Found) {
+          m3u8Found = url;
+          console.log(`[SNIFF] 🎯 ENCONTRADO: ${url.substring(0, 80)}...`);
+        }
+      }
+      req.continue();
+    });
+    
+    const startTime = Date.now();
+    
+    // Navega
+    await page.goto(embedUrl, { 
+      waitUntil: 'networkidle2', 
+      timeout: 15000 
+    });
+    
+    // Aguarda m3u8 ou timeout
+    while (!m3u8Found && (Date.now() - startTime) < SNIFF_TIMEOUT) {
+      await new Promise(r => setTimeout(r, 500));
+      
+      // Força play
+      try {
+        await page.evaluate(() => {
+          const video = document.querySelector('video');
+          if (video) {
+            video.play().catch(() => {});
+            video.muted = true;
+          }
+        });
+        
+        const playBtn = await page.$('.play-button, .vjs-big-play-button, [class*="play"], button');
+        if (playBtn) await playBtn.click().catch(() => {});
+      } catch (e) {}
+    }
+    
+    await browser.close();
+    
+    if (m3u8Found) {
+      CACHE.set(embedUrl, { url: m3u8Found, time: Date.now() });
+      console.log(`[SNIFF] ✅ Sucesso!`);
+      return m3u8Found;
+    }
+    
+    console.log(`[SNIFF] ❌ Timeout`);
+    return null;
+    
+  } catch (error) {
+    console.error(`[SNIFF] Erro:`, error.message);
+    if (browser) await browser.close().catch(() => {});
+    return null;
+  }
+}
 
 // ==========================================
 // STREAM HANDLER
@@ -49,106 +128,78 @@ const builder = new addonBuilder(manifest);
 builder.defineStreamHandler(async (args) => {
   const { type, id } = args;
   
-  console.log(`[${new Date().toISOString()}] Requisição: type=${type}, id=${id}`);
+  console.log(`[REQ] ${type}: ${id}`);
   
   try {
-    // Extrai TMDB ID (remove prefixo "tmdb:")
-    const cleanId = id.replace("tmdb:", "");
-    
-    // Extrai season/episode se for série
-    // Formato: tmdb:12345:1:3 (season 1, episode 3)
-    let tmdbId = cleanId;
+    // Parse ID
+    let cleanId = id.replace(/^(imdb:|tmdb:)/, "");
+    let contentId = cleanId;
     let season = 1;
     let episode = 1;
     
     if (type === "series") {
       const parts = cleanId.split(":");
-      tmdbId = parts[0];
-      if (parts.length >= 3) {
-        season = parseInt(parts[1]) || 1;
-        episode = parseInt(parts[2]) || 1;
-      }
+      contentId = parts[0];
+      if (parts.length >= 2) season = parseInt(parts[1]) || 1;
+      if (parts.length >= 3) episode = parseInt(parts[2]) || 1;
     }
     
-    // Gera URL do embed baseado no tipo
-    let embedUrl;
-    let title;
+    // URL Fembed
+    const embedUrl = type === "series" 
+      ? `https://fembed.sx/e/${contentId}-dub/${season}-${episode}`
+      : `https://fembed.sx/e/${contentId}-dub`;
     
-    if (type === "series") {
-      // Séries: https://fembed.sx/e/{tmdbId}-dub/{season}-{episode}
-      embedUrl = `https://fembed.sx/e/${tmdbId}-dub/${season}-${episode}`;
-      title = `S${season.toString().padStart(2, "0")}E${episode.toString().padStart(2, "0")} - Fembed Dublado`;
-    } else {
-      // Filmes: https://fembed.sx/e/{tmdbId}-dub
-      embedUrl = `https://fembed.sx/e/${tmdbId}-dub`;
-      title = "Fembed - Dublado";
-    }
+    console.log(`[REQ] Embed: ${embedUrl}`);
     
-    console.log(`[${new Date().toISOString()}] Embed URL: ${embedUrl}`);
+    // 🔥 SNIFFA
+    const m3u8Url = await sniffM3U8(embedUrl);
     
-    // Retorna stream com metadados para seu app Flutter
-    const stream = {
-      // URL que será passada para o EmbedPlayer
-      url: embedUrl,
-      
-      // Título exibido no Stremio
-      title: title,
-      
-      // Descrição
-      description: "🔗 Clique para abrir no Ecran Filmes",
-      
-      // Metadados extras
-      behaviorHints: {
-        // Indica que precisa de sniffer (não é stream direto)
-        notWebReady: true,
-        
-        // Headers necessários para o sniffer
-        proxyHeaders: {
-          request: {
-            "Referer": "https://fembed.sx/",
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Mobile Safari/537.36",
-            "Accept": "*/*",
-            "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7"
+    if (m3u8Url) {
+      return { 
+        streams: [{
+          url: m3u8Url,
+          title: type === "series" 
+            ? `S${season.toString().padStart(2, "0")}E${episode.toString().padStart(2, "0")} - Fembed HD 🎯`
+            : "Fembed - Dublado HD 🎯",
+          description: "✅ Stream direto",
+          behaviorHints: {
+            notWebReady: false,
+            proxyHeaders: {
+              request: {
+                "Referer": "https://fembed.sx/",
+                "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S911B) AppleWebKit/537.36",
+                "Accept": "*/*"
+              }
+            }
           }
-        },
-        
-        // Indica que deve abrir externamente
-        external: true
-      }
+        }] 
+      };
+    }
+    
+    // Fallback
+    const deepLink = `ecranfilmes://play?url=${encodeURIComponent(embedUrl)}&id=${contentId}&s=${season}&e=${episode}&type=${type}`;
+    
+    return { 
+      streams: [{
+        url: deepLink,
+        title: type === "series" 
+          ? `S${season.toString().padStart(2, "0")}E${episode.toString().padStart(2, "0")} - Abrir no App 📱`
+          : "Abrir no Ecran Filmes 📱",
+        description: "🔗 Requer app instalado",
+        external: true,
+        behaviorHints: { external: true, notWebReady: true }
+      }] 
     };
     
-    return { streams: [stream] };
-    
   } catch (error) {
-    console.error(`[${new Date().toISOString()}] Erro:`, error);
+    console.error(`[REQ] Erro:`, error);
     return { streams: [] };
   }
 });
 
 // ==========================================
-// INICIA SERVIDOR
+// START
 // ==========================================
-const addonInterface = builder.getInterface();
-
-serveHTTP(addonInterface, { port: PORT })
-  .then(() => {
-    console.log(`
-╔════════════════════════════════════════════════════════════╗
-║           🎬 Ecran Filmes - Stremio Addon                  ║
-╠════════════════════════════════════════════════════════════╣
-║  Addon rodando na porta: ${PORT}                            ║
-║                                                            ║
-║  Manifest:  http://localhost:${PORT}/manifest.json          ║
-║                                                            ║
-║  Para instalar no Stremio:                                 ║
-║  stremio://install?url=http://localhost:${PORT}/manifest.json
-╚════════════════════════════════════════════════════════════╝
-    `);
-    
-    // Publica no diretório central (opcional - descomente se quiser)
-    // publishToCentral(`http://localhost:${PORT}/manifest.json`);
-  })
-  .catch(err => {
-    console.error("Erro ao iniciar servidor:", err);
-    process.exit(1);
-  });
+const port = process.env.PORT || 10000;
+serveHTTP(builder.getInterface(), { port });
+console.log(`🚀 Ecran Filmes addon rodando na porta ${port}`);
