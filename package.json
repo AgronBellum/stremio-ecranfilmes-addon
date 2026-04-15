@@ -1,0 +1,19 @@
+{
+  "name": "stremio-fembed-addon",
+  "version": "1.0.0",
+  "description": "Addon Stremio com sniffer Fembed para Ecran Filmes",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}
